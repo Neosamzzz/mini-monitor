@@ -136,6 +136,7 @@ final class Monitor: ObservableObject {
     private var cpuSampler = CPUSampler()
     private let tempReader = TempReader()
     private var timer: Timer?
+    private var panelOpen = false
 
     init() {
         _ = cpuSampler.sample()
@@ -147,12 +148,13 @@ final class Monitor: ObservableObject {
         cpu = cpuSampler.sample() ?? cpu
         temp = tempReader.read()
         mem = MemoryReading.read()
-        labelImage = renderLabel()
+        // 面板打开时换标签图会让状态栏按钮丢掉"已打开"状态,再点图标偶尔关不掉,所以先冻结
+        if !panelOpen { labelImage = renderLabel() }
     }
 
     /// 菜单栏常显:平时 2 秒刷新一次,面板打开时 1 秒
-    func panelOpened() { refresh(); schedule(interval: 1) }
-    func panelClosed() { schedule(interval: 2) }
+    func panelOpened() { refresh(); panelOpen = true; schedule(interval: 1) }
+    func panelClosed() { panelOpen = false; refresh(); schedule(interval: 2) }
 
     private func schedule(interval: TimeInterval) {
         timer?.invalidate()
