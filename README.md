@@ -2,7 +2,7 @@
 
 极简 macOS 菜单栏监视器：CPU、温度、内存。单个 Swift 文件。
 
-<img src="docs/screenshot.png" width="348" alt="MiniMonitor 面板">
+<img src="docs/screenshot.png" width="301" alt="菜单栏和面板">
 
 - 菜单栏常显 CPU / 温度 / 内存
 - 面板显示内存压力和 Swap,以及占用最高的 App
