@@ -777,10 +777,18 @@ enum Entry {
                 usleep(1_000_000)
                 m.apply(ps.sample())
                 m.cpu = 23; m.temp = 52; m.mem = MemoryReading.read()
-                let r = ImageRenderer(content: PanelView(m: m).background(Color.white).environment(\.colorScheme, .light))
-                r.scale = 2
-                if let cg = r.cgImage {
-                    try? NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:])?
+                // 用 NSHostingView 而不是 ImageRenderer,系统分段控件才画得出来
+                _ = NSApplication.shared
+                NSApp.appearance = NSAppearance(named: .aqua)
+                let v = NSHostingView(rootView: PanelView(m: m)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 14))
+                    .padding(24)
+                    .background(Color(white: 0.93)))
+                v.frame = NSRect(origin: .zero, size: v.fittingSize)
+                v.layoutSubtreeIfNeeded()
+                if let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) {
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?
                         .write(to: URL(fileURLWithPath: CommandLine.arguments[i + 1]))
                 }
             }
