@@ -1,5 +1,6 @@
 import SwiftUI
 import Darwin
+import IOKit
 import ServiceManagement
 import UserNotifications
 
@@ -74,69 +75,65 @@ struct MemoryReading {
     }
 }
 
-/// Apple 芯片温度:走 IOKit 的非公开 HID 传感器接口,取不到时返回 nil
+/// Apple 芯片 CPU 温度:读 SMC 的 Tp* 核心传感器取平均(同 Stats/iStat 的来源),取不到时返回 nil。
+/// HID 接口的 PMU tdie 是电源管理芯片的温度，满载时比核心低 30°C 以上，不能用
 final class TempReader {
-    private typealias CreateFn = @convention(c) (UnsafeRawPointer?) -> UnsafeMutableRawPointer?
-    private typealias SetMatchingFn = @convention(c) (UnsafeMutableRawPointer, UnsafeRawPointer) -> Int32
-    private typealias CopyServicesFn = @convention(c) (UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
-    private typealias CopyPropertyFn = @convention(c) (UnsafeRawPointer, UnsafeRawPointer) -> UnsafeMutableRawPointer?
-    private typealias CopyEventFn = @convention(c) (UnsafeRawPointer, Int64, Int32, Int64) -> UnsafeMutableRawPointer?
-    private typealias GetFloatFn = @convention(c) (UnsafeMutableRawPointer, Int32) -> Double
+    /// SMCKeyData_t,布局须和内核一致(80 字节)
+    private struct KeyData {
+        var key: UInt32 = 0
+        var vers = (UInt8(0), UInt8(0), UInt8(0), UInt8(0), UInt16(0))
+        var pLimit = (UInt16(0), UInt16(0), UInt32(0), UInt32(0), UInt32(0))
+        var keyInfo = (size: UInt32(0), type: UInt32(0), attr: UInt8(0), UInt8(0), UInt8(0), UInt8(0))
+        var result: UInt8 = 0, status: UInt8 = 0, cmd: UInt8 = 0
+        var index: UInt32 = 0
+        var bytes: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
+    }
+    private static let cmdReadBytes: UInt8 = 5, cmdReadIndex: UInt8 = 8, cmdReadInfo: UInt8 = 9
 
-    private var copyEvent: CopyEventFn?
-    private var getFloat: GetFloatFn?
-    private var services: CFArray?
-    private var cpuIndexes: [Int] = []
-
-    private static let temperatureType: Int64 = 15
-    private static var temperatureField: Int32 { Int32(temperatureType << 16) }
+    private var conn: io_connect_t = 0
+    private var keys: [UInt32] = []   // Tp* 且类型为 flt 的键
 
     init() {
-        guard let h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW),
-              let create = dlsym(h, "IOHIDEventSystemClientCreate"),
-              let setMatching = dlsym(h, "IOHIDEventSystemClientSetMatching"),
-              let copyServices = dlsym(h, "IOHIDEventSystemClientCopyServices"),
-              let copyProperty = dlsym(h, "IOHIDServiceClientCopyProperty"),
-              let copyEvent = dlsym(h, "IOHIDServiceClientCopyEvent"),
-              let getFloat = dlsym(h, "IOHIDEventGetFloatValue")
-        else { return }
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard svc != 0 else { return }
+        defer { IOObjectRelease(svc) }
+        guard IOServiceOpen(svc, mach_task_self_, 0, &conn) == KERN_SUCCESS else { conn = 0; return }
 
-        self.copyEvent = unsafeBitCast(copyEvent, to: CopyEventFn.self)
-        self.getFloat = unsafeBitCast(getFloat, to: GetFloatFn.self)
-
-        guard let client = unsafeBitCast(create, to: CreateFn.self)(nil) else { return }
-        // 0xff00 / 5 = Apple 厂商定义的温度传感器
-        let matching = ["PrimaryUsagePage": 0xff00, "PrimaryUsage": 5] as CFDictionary
-        _ = unsafeBitCast(setMatching, to: SetMatchingFn.self)(client, Unmanaged.passUnretained(matching).toOpaque())
-        guard let arr = unsafeBitCast(copyServices, to: CopyServicesFn.self)(client) else { return }
-        let services = Unmanaged<CFArray>.fromOpaque(arr).takeRetainedValue()
-        self.services = services
-
-        // 优先用 CPU 晶粒传感器(名字含 tdie),没有则退回全部传感器
-        let getProp = unsafeBitCast(copyProperty, to: CopyPropertyFn.self)
-        let key = Unmanaged.passUnretained("Product" as CFString).toOpaque()
-        for i in 0..<CFArrayGetCount(services) {
-            guard let svc = CFArrayGetValueAtIndex(services, i),
-                  let raw = getProp(svc, key) else { continue }
-            let name = Unmanaged<AnyObject>.fromOpaque(raw).takeRetainedValue() as? String ?? ""
-            if name.lowercased().contains("tdie") { cpuIndexes.append(i) }
+        var count = KeyData(); count.key = Self.fourCC("#KEY"); count.keyInfo.size = 4; count.cmd = Self.cmdReadBytes
+        guard call(&count) else { return }
+        let n = UInt32(truncatingIfNeeded: count.bytes.0).byteSwapped
+        let flt = Self.fourCC("flt ")
+        for i in 0..<n {
+            var k = KeyData(); k.cmd = Self.cmdReadIndex; k.index = i
+            guard call(&k), k.key >> 16 == Self.fourCC("Tp") else { continue }
+            var info = KeyData(); info.key = k.key; info.cmd = Self.cmdReadInfo
+            if call(&info), info.keyInfo.type == flt, info.keyInfo.size == 4 { keys.append(k.key) }
         }
-        if cpuIndexes.isEmpty { cpuIndexes = Array(0..<CFArrayGetCount(services)) }
     }
 
-    /// CPU 传感器的平均温度(°C)
+    deinit { if conn != 0 { IOServiceClose(conn) } }
+
+    /// CPU 核心传感器的平均温度(°C)
     func read() -> Double? {
-        guard let services, let copyEvent, let getFloat else { return nil }
         var values: [Double] = []
-        for i in cpuIndexes {
-            guard let svc = CFArrayGetValueAtIndex(services, i),
-                  let ev = copyEvent(svc, Self.temperatureType, 0, 0) else { continue }
-            let v = getFloat(ev, Self.temperatureField)
-            Unmanaged<AnyObject>.fromOpaque(ev).release()
+        for key in keys {
+            var d = KeyData(); d.key = key; d.keyInfo.size = 4; d.cmd = Self.cmdReadBytes
+            guard call(&d) else { continue }
+            let v = Double(Float(bitPattern: UInt32(truncatingIfNeeded: d.bytes.0)))
             if v > 10, v < 130 { values.append(v) }
         }
         return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
     }
+
+    private func call(_ d: inout KeyData) -> Bool {
+        guard conn != 0 else { return false }
+        var out = KeyData(), size = MemoryLayout<KeyData>.stride
+        let kr = IOConnectCallStructMethod(conn, 2, &d, MemoryLayout<KeyData>.stride, &out, &size)
+        d = out
+        return kr == KERN_SUCCESS && out.result == 0
+    }
+
+    private static func fourCC(_ s: String) -> UInt32 { s.utf8.reduce(0) { $0 << 8 | UInt32($1) } }
 }
 
 struct ProcInfo: Identifiable {
