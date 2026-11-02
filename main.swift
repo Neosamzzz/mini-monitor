@@ -75,8 +75,9 @@ struct MemoryReading {
     }
 }
 
-/// Apple 芯片 CPU 温度:读 SMC 的 Tp* 核心传感器取平均(同 Stats/iStat 的来源),取不到时返回 nil。
-/// HID 接口的 PMU tdie 是电源管理芯片的温度，满载时比核心低 30°C 以上，不能用
+/// 基础款 M2 的 CPU 温度:只读取已确认的 8 个核心测点，不按 Tp 前缀混合其他测点。
+/// 映射来源: https://github.com/exelban/stats/issues/1012 (M2 MacBook Air 实机对照)。
+/// SMC 为非公开接口;芯片未适配、测点缺失或读数异常时返回 nil，不猜测温度。
 final class TempReader {
     /// SMCKeyData_t,布局须和内核一致(80 字节)
     private struct KeyData {
@@ -88,39 +89,44 @@ final class TempReader {
         var index: UInt32 = 0
         var bytes: (UInt64, UInt64, UInt64, UInt64) = (0, 0, 0, 0)
     }
-    private static let cmdReadBytes: UInt8 = 5, cmdReadIndex: UInt8 = 8, cmdReadInfo: UInt8 = 9
+    private static let cmdReadBytes: UInt8 = 5, cmdReadInfo: UInt8 = 9
 
     private var conn: io_connect_t = 0
-    private var keys: [UInt32] = []   // Tp* 且类型为 flt 的键
+    private var keys: [UInt32] = []
 
     init() {
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else { return }
+        var brand = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &brand, &size, nil, 0) == 0,
+              String(cString: brand) == "Apple M2" else { return }
+        // 基础款 M2:4 个性能核 + 4 个能效核。Pro/Max 和其他代芯片的键不能混用。
+        let cpuKeys = ["Tp01", "Tp09", "Tp0f", "Tp0n", "Tp05", "Tp0D", "Tp0j", "Tp0r"].map(Self.fourCC)
         let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
         guard svc != 0 else { return }
         defer { IOObjectRelease(svc) }
         guard IOServiceOpen(svc, mach_task_self_, 0, &conn) == KERN_SUCCESS else { conn = 0; return }
 
-        var count = KeyData(); count.key = Self.fourCC("#KEY"); count.keyInfo.size = 4; count.cmd = Self.cmdReadBytes
-        guard call(&count) else { return }
-        let n = UInt32(truncatingIfNeeded: count.bytes.0).byteSwapped
         let flt = Self.fourCC("flt ")
-        for i in 0..<n {
-            var k = KeyData(); k.cmd = Self.cmdReadIndex; k.index = i
-            guard call(&k), k.key >> 16 == Self.fourCC("Tp") else { continue }
-            var info = KeyData(); info.key = k.key; info.cmd = Self.cmdReadInfo
-            if call(&info), info.keyInfo.type == flt, info.keyInfo.size == 4 { keys.append(k.key) }
+        for key in cpuKeys {
+            var info = KeyData(); info.key = key; info.cmd = Self.cmdReadInfo
+            guard call(&info), info.keyInfo.type == flt, info.keyInfo.size == 4 else { return }
         }
+        keys = cpuKeys
     }
 
     deinit { if conn != 0 { IOServiceClose(conn) } }
 
     /// CPU 核心传感器的平均温度(°C)
     func read() -> Double? {
+        guard !keys.isEmpty else { return nil }
         var values: [Double] = []
         for key in keys {
             var d = KeyData(); d.key = key; d.keyInfo.size = 4; d.cmd = Self.cmdReadBytes
-            guard call(&d) else { continue }
+            guard call(&d) else { return nil }
             let v = Double(Float(bitPattern: UInt32(truncatingIfNeeded: d.bytes.0)))
-            if v > 10, v < 130 { values.append(v) }
+            guard v.isFinite, v > 10, v < 130 else { return nil }
+            values.append(v)
         }
         return values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
     }

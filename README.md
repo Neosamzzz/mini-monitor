@@ -18,7 +18,7 @@
 open MiniMonitor.app
 ```
 
-温度读取用了非公开接口，仅在 Apple 芯片上测试过。
+温度通过非公开 SMC 接口读取，目前适配基础款 Apple M2 的 CPU 核心平均温度；其他芯片或读取失败时显示 `—`。
 
 ## License
 
